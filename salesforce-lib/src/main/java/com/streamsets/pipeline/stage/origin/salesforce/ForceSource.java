@@ -248,17 +248,7 @@ public class ForceSource extends BaseSource {
     }
 
     if (issues.isEmpty()) {
-      try {
-        recordCreator = buildRecordCreator();
-        recordCreator.buildMetadataCache(partnerConnection);
-      } catch (StageException e) {
-        LOG.error("Exception getting metadata map: {}", e);
-        issues.add(getContext().createConfigIssue(Groups.QUERY.name(),
-            ForceConfigBean.CONF_PREFIX + "soqlQuery",
-            Errors.FORCE_21,
-            sobjectType
-        ));
-      }
+      recordCreator = buildRecordCreator();
     }
 
     // If issues is not empty, the UI will inform the user of each configuration issue in the list.
@@ -323,12 +313,20 @@ public class ForceSource extends BaseSource {
 
   private String prepareQuery(String query, String lastSourceOffset) throws StageException {
     final String offset = (null == lastSourceOffset) ? conf.initialOffset : lastSourceOffset;
+    SobjectRecordCreator sobjectRecordCreator = (SobjectRecordCreator)recordCreator;
 
-    recordCreator.buildMetadataCache(partnerConnection);
+    String expandedQuery;
+    if (sobjectRecordCreator.queryHasWildcard(query)) {
+      // Can't follow relationships on a wildcard query, so build the cache from the object type
+      sobjectRecordCreator.buildMetadataCache(partnerConnection);
+      expandedQuery = sobjectRecordCreator.expandWildcard(query);
+    } else {
+      // Use the query in building the cache
+      expandedQuery = query;
+      sobjectRecordCreator.buildMetadataCacheFromQuery(partnerConnection, query);
+    }
 
-    query = recordCreator.expandWildcard(query);
-
-    return query.replaceAll("\\$\\{offset\\}", offset);
+    return expandedQuery.replaceAll("\\$\\{offset\\}", offset);
   }
 
   /** {@inheritDoc} */
@@ -553,7 +551,7 @@ public class ForceSource extends BaseSource {
     return item;
   }
 
-  public String soapProduce(String lastSourceOffset, int maxBatchSize, BatchMaker batchMaker) throws StageException {
+  private String soapProduce(String lastSourceOffset, int maxBatchSize, BatchMaker batchMaker) throws StageException {
 
     String nextSourceOffset = (null == lastSourceOffset) ? RECORD_ID_OFFSET_PREFIX + conf.initialOffset : lastSourceOffset;
 
@@ -732,7 +730,11 @@ public class ForceSource extends BaseSource {
 
     if (recordCreator instanceof SobjectRecordCreator) {
       // Switch out recordCreator
-      recordCreator = new PushTopicRecordCreator((SobjectRecordCreator)recordCreator);
+      PushTopicRecordCreator pushTopicRecordCreator = new PushTopicRecordCreator((SobjectRecordCreator)recordCreator);
+      if (!pushTopicRecordCreator.metadataCacheExists()) {
+        pushTopicRecordCreator.buildMetadataCache(partnerConnection);
+      }
+      recordCreator = pushTopicRecordCreator;
     }
 
     if (forceConsumer == null) {
@@ -764,18 +766,34 @@ public class ForceSource extends BaseSource {
       return nextSourceOffset;
     }
 
-    List<Message> messages = new ArrayList<>(maxBatchSize);
-    messageQueue.drainTo(messages, maxBatchSize);
+    // Loop if we're in preview mode - we'll get killed after the preview timeout if no data arrives
+    boolean done = false;
+    while (!done) {
+      List<Message> messages = new ArrayList<>(maxBatchSize);
+      messageQueue.drainTo(messages, maxBatchSize);
 
-    for (Message message : messages) {
-      try {
-        if (message.getChannel().startsWith(META)) {
-          processMetaMessage(message, nextSourceOffset);
-        } else {
-          nextSourceOffset = processDataMessage(message, batchMaker);
+      for (Message message : messages) {
+        try {
+          if (message.getChannel().startsWith(META)) {
+            // Handshake, subscription messages
+            processMetaMessage(message, nextSourceOffset);
+          } else {
+            // Yay - actual data messages
+            nextSourceOffset = processDataMessage(message, batchMaker);
+            done = true;
+          }
+        } catch (IOException e) {
+          throw new StageException(Errors.FORCE_02, e);
         }
-      } catch (IOException e) {
-        throw new StageException(Errors.FORCE_02, e);
+      }
+      if (!done && getContext().isPreview()) {
+        // In preview - give data messages a chance to arrive
+        if (!ThreadUtil.sleep(1000)) {
+          // Interrupted!
+          done = true;
+        }
+      } else {
+        done = true;
       }
     }
 
